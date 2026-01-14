@@ -1,0 +1,7 @@
+model/__pycache__
+out
+website/
+docs-minimind/
+
+dataset/*.jsonl
+dataset/**/*.jsonl
