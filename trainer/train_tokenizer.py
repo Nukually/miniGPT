@@ -1,12 +1,3 @@
-"""
-Train a ByteLevel-BPE tokenizer and export HuggingFace-compatible tokenizer files.
-
-Note:
-- It is NOT recommended to re-train the tokenizer for MiniMind. MiniMind already includes one.
-- This script is mainly for learning and reference.
-- Training models with different tokenizers will lead to inconsistent outputs and reduce model reusability in the community.
-"""
-
 from __future__ import annotations
 
 import json
