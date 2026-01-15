@@ -1,3 +1,13 @@
-from .model_minigpt import MiniGPT, MiniGPTConfig, MiniGPTOutput
+from .model_minigpt import (
+    MiniGPT,
+    MiniGPTCausalLMOutput,
+    MiniGPTConfig,
+    MiniGPTForCausalLM,
+)
 
-__all__ = ["MiniGPT", "MiniGPTConfig", "MiniGPTOutput"]
+__all__ = [
+    "MiniGPT",
+    "MiniGPTCausalLMOutput",
+    "MiniGPTConfig",
+    "MiniGPTForCausalLM",
+]
