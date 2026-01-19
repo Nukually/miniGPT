@@ -5,7 +5,6 @@ dataset/__pycache__
 trainer/__pycache__
 out
 website/
-docs-minimind/
 pycache/*
 dataset/*.jsonl
 dataset/**/*.jsonl
