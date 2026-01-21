@@ -27,6 +27,7 @@ warnings.filterwarnings('ignore')
 
 
 def get_model_params(model: torch.nn.Module, config: MiniGPTConfig) -> None:
+    # 统计总参数量与MoE“激活参数量”，便于估算显存与算力
     total = sum(p.numel() for p in model.parameters()) / 1e6
     n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
     n_active = getattr(config, 'num_experts_per_tok', 0)
@@ -51,13 +52,16 @@ def Logger(content: str) -> None:
 
 
 def get_lr(current_step: int, total_steps: int, lr: float) -> float:
+    # 余弦退火，最低为初始lr的10%
     return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
 
 
 def init_distributed_mode() -> int:
+    # 若没有RANK环境变量则视为单机单卡
     if int(os.environ.get("RANK", -1)) == -1:
         return 0  # 非DDP模式
 
+    # DDP模式：初始化进程组并绑定本地GPU
     dist.init_process_group(backend="nccl")
     local_rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(local_rank)
@@ -65,6 +69,7 @@ def init_distributed_mode() -> int:
 
 
 def setup_seed(seed: int) -> None:
+    # 固定随机种子，保证可复现实验
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -85,15 +90,18 @@ def lm_checkpoint(
     save_dir: str = '../checkpoints',
     **kwargs: Dict[str, Any],
 ) -> Optional[Dict[str, Any]]:
+    # 保存两份：权重文件 + 可恢复训练状态（optimizer/scaler/epoch/step）
     os.makedirs(save_dir, exist_ok=True)
     moe_path = '_moe' if lm_config.use_moe else ''
     ckp_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}.pth'
     resume_path = f'{save_dir}/{weight}_{lm_config.hidden_size}{moe_path}_resume.pth'
 
     if model is not None:
+        # DDP时拿到原始模型，避免保存wrapper
         raw_model = model.module if isinstance(model, DistributedDataParallel) else model
         raw_model = getattr(raw_model, '_orig_mod', raw_model)
         state_dict = raw_model.state_dict()
+        # 半精度落盘更省空间
         state_dict = {k: v.half().cpu() for k, v in state_dict.items()}
         ckp_tmp = ckp_path + '.tmp'
         torch.save(state_dict, ckp_tmp)
@@ -129,6 +137,7 @@ def lm_checkpoint(
         del state_dict, resume_data
         torch.cuda.empty_cache()
     else:  # 加载模式
+        # 读取恢复文件，必要时根据GPU数量变化调整step
         if os.path.exists(resume_path):
             ckp_data = torch.load(resume_path, map_location='cpu')
             saved_ws = ckp_data.get('world_size', 1)
@@ -147,10 +156,12 @@ def init_model(
     save_dir: str = '../out',
     device: str = 'cuda',
 ) -> tuple[torch.nn.Module, Any]:
+    # tokenizer从训练目录加载；模型按配置初始化
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     model = MiniGPTForCausalLM(lm_config)
 
     if from_weight != 'none':
+        # 可选择从已有权重继续训练
         moe_suffix = '_moe' if lm_config.use_moe else ''
         weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
         weights = torch.load(weight_path, map_location=device)
@@ -168,6 +179,7 @@ class SkipBatchSampler(torch.utils.data.Sampler):
         self.skip_batches = skip_batches
 
     def __iter__(self):
+        # 从指定batch开始迭代，用于断点续训跳过已训练部分
         batch = []
         skipped = 0
         for idx in self.sampler:
@@ -188,22 +200,26 @@ class SkipBatchSampler(torch.utils.data.Sampler):
 
 
 def train_epoch(epoch: int, loader, iters: int, start_step: int = 0, wandb: Optional[Any] = None) -> None:
+    # 单个epoch的训练逻辑：前向、反传、梯度累积与日志
     start_time = time.time()
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
+        # 按全局step更新学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         with autocast_ctx:
             res = model(input_ids, labels=labels)
+            # MoE会额外返回aux_loss；做梯度累积需先除以累积步数
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
         scaler.scale(loss).backward()
 
         if (step + 1) % args.accumulation_steps == 0:
+            # 反scale后裁剪梯度，避免梯度爆炸
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
@@ -213,6 +229,7 @@ def train_epoch(epoch: int, loader, iters: int, start_step: int = 0, wandb: Opti
             optimizer.zero_grad(set_to_none=True)
 
         if step % args.log_interval == 0 or step == iters - 1:
+            # 统计当前loss与速度
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
@@ -230,6 +247,7 @@ def train_epoch(epoch: int, loader, iters: int, start_step: int = 0, wandb: Opti
                 })
 
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            # 主进程定期保存模型与恢复文件
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -273,6 +291,7 @@ if __name__ == "__main__":
     # ========== 1. 初始化环境和随机种子 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized():
+        # DDP中每个进程绑定一张GPU
         args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
     
@@ -310,12 +329,14 @@ if __name__ == "__main__":
         Logger('torch.compile enabled')
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
+    # 只有float16需要GradScaler；bf16下无需缩放
     scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == 'float16'))
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     
     # ========== 6. 从ckp恢复状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
+        # 恢复模型、优化器与混合精度状态
         model.load_state_dict(ckp_data['model'])
         optimizer.load_state_dict(ckp_data['optimizer'])
         scaler.load_state_dict(ckp_data['scaler'])
