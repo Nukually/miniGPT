@@ -13,19 +13,8 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import Sampler
 from transformers import AutoTokenizer
-from model.model_minigpt import MiniGPTForCausalLM
-
-def get_model_params(model, config):
-    total = sum(p.numel() for p in model.parameters()) / 1e6
-    n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
-    n_active = getattr(config, 'num_experts_per_tok', 0)
-    n_shared = getattr(config, 'n_shared_experts', 0)
-    expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
-    shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
-    base = total - (expert * n_routed) - (shared_expert * n_shared)
-    active = base + (expert * n_active) + (shared_expert * n_shared)
-    if active < total: Logger(f'Model Params: {total:.2f}M-A{active:.2f}M')
-    else: Logger(f'Model Params: {total:.2f}M')
+from model.model_minigpt import MiniGPTForCausalLM, init_model, get_model_params
+from typing import Any, Optional
 
 
 def is_main_process():
@@ -116,21 +105,6 @@ def lm_checkpoint(lm_config, weight='full_sft', model=None, optimizer=None, epoc
         return None
 
 
-def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
-    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-    model = MiniGPTForCausalLM(lm_config)
-
-    if from_weight!= 'none':
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        weights = torch.load(weight_path, map_location=device)
-        model.load_state_dict(weights, strict=False)
-
-    get_model_params(model, lm_config)
-    Logger(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
-    return model.to(device), tokenizer
-
-
 class SkipBatchSampler(Sampler):
     def __init__(self, sampler, batch_size, skip_batches=0):
         self.sampler = sampler
@@ -155,3 +129,72 @@ class SkipBatchSampler(Sampler):
     def __len__(self):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
         return max(0, total_batches - self.skip_batches)
+
+
+def train_epoch(epoch: int, loader, iters: int, model, optimizer, scaler, args, lm_config, start_step: int = 0, wandb: Optional[Any] = None) -> None:
+    # 单个epoch的训练逻辑：前向、反传、梯度累积与日志
+    import time
+    start_time = time.time()
+    
+    device_type = "cuda" if "cuda" in args.device else "cpu"
+    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
+
+    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
+        input_ids = input_ids.to(args.device)
+        labels = labels.to(args.device)
+        # 按全局step更新学习率
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+
+        with autocast_ctx:
+            res = model(input_ids, labels=labels)
+            # MoE会额外返回aux_loss；做梯度累积需先除以累积步数
+            loss = res.loss + res.aux_loss
+            loss = loss / args.accumulation_steps
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % args.accumulation_steps == 0:
+            # 反scale后裁剪梯度，避免梯度爆炸
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+            scaler.step(optimizer)
+            scaler.update()
+
+            optimizer.zero_grad(set_to_none=True)
+
+        if step % args.log_interval == 0 or step == iters - 1:
+            # 统计当前loss与速度
+            spend_time = time.time() - start_time
+            current_loss = loss.item() * args.accumulation_steps
+            current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
+            current_logits_loss = current_loss - current_aux_loss
+            current_lr = optimizer.param_groups[-1]['lr']
+            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            if wandb:
+                wandb.log({
+                    "loss": current_loss,
+                    "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss,
+                    "learning_rate": current_lr,
+                    "epoch_time": eta_min,
+                })
+
+        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+            # 主进程定期保存模型与恢复文件
+            model.eval()
+            moe_suffix = '_moe' if lm_config.use_moe else ''
+            ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+            raw_model = model.module if isinstance(model, DistributedDataParallel) else model
+            raw_model = getattr(raw_model, '_orig_mod', raw_model)
+            state_dict = raw_model.state_dict()
+            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
+            lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer, scaler=scaler, epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints')
+            model.train()
+            del state_dict
+
+        del input_ids, labels, res, loss

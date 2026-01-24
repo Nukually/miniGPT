@@ -1,4 +1,7 @@
 from transformers import PretrainedConfig
+import os
+import torch.distributed as dist
+from transformers import AutoTokenizer
 
 
 class MiniGPTConfig(PretrainedConfig):
@@ -459,3 +462,42 @@ class MiniGPTForCausalLM(PreTrainedModel, GenerationMixin):
         output = CausalLMOutputWithPast(loss=loss, logits=logits, past_key_values=past_key_values, hidden_states=hidden_states)
         output.aux_loss = aux_loss
         return output
+
+
+def _is_main_process():
+    return not dist.is_initialized() or dist.get_rank() == 0
+
+
+def _log(content):
+    if _is_main_process():
+        print(content)
+
+
+def get_model_params(model, config):
+    total = sum(p.numel() for p in model.parameters()) / 1e6
+    n_routed = getattr(config, 'n_routed_experts', getattr(config, 'num_experts', 0))
+    n_active = getattr(config, 'num_experts_per_tok', 0)
+    n_shared = getattr(config, 'n_shared_experts', 0)
+    expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.experts.0.' in n) / 1e6
+    shared_expert = sum(p.numel() for n, p in model.named_parameters() if 'mlp.shared_experts.0.' in n) / 1e6
+    base = total - (expert * n_routed) - (shared_expert * n_shared)
+    active = base + (expert * n_active) + (shared_expert * n_shared)
+    if active < total:
+        _log(f'Model Params: {total:.2f}M-A{active:.2f}M')
+    else:
+        _log(f'Model Params: {total:.2f}M')
+
+
+def init_model(lm_config, from_weight='pretrain', tokenizer_path='../model', save_dir='../out', device='cuda'):
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    model = MiniGPTForCausalLM(lm_config)
+
+    if from_weight != 'none':
+        moe_suffix = '_moe' if lm_config.use_moe else ''
+        weight_path = f'{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+        weights = torch.load(weight_path, map_location=device)
+        model.load_state_dict(weights, strict=False)
+
+    get_model_params(model, lm_config)
+    _log(f'Trainable Params: {sum(p.numel() for p in model.parameters() if p.requires_grad) / 1e6:.3f}M')
+    return model.to(device), tokenizer
