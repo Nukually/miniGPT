@@ -193,13 +193,18 @@ def train_epoch(epoch: int, loader, iters: int, model, optimizer, scaler, args, 
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
+            try:
+                current_ppl = math.exp(current_logits_loss)
+            except OverflowError:
+                current_ppl = float('inf')
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
+            Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, ppl: {current_ppl:.2f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             if wandb:
                 wandb.log({
                     "loss": current_loss,
                     "logits_loss": current_logits_loss,
+                    "ppl": current_ppl,
                     "aux_loss": current_aux_loss,
                     "learning_rate": current_lr,
                     "epoch_time": eta_min,

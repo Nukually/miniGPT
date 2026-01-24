@@ -52,7 +52,7 @@ if __name__ == '__main__':
         from_weight = "none"
         from_resume = 0
         use_compile = 0
-        use_wandb = False
+        use_wandb = True
         wandb_project = "MiniGPT-Pretrain"
 
     args = TrainingArgs()
@@ -86,6 +86,7 @@ if __name__ == '__main__':
     wandb = None
     if args.use_wandb and is_main_process():
         import swanlab as wandb
+        wandb.login(api_key="IqCfAhzpPPdHwxoIEBtJR")
         wandb_id = ckp_data.get('wandb_id') if ckp_data else None
         resume = 'must' if wandb_id else None
         wandb_run_name = f"MiniGPT-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
