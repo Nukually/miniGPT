@@ -17,10 +17,8 @@ sys.path.append(_REPO_ROOT)
 from dataset.lm_dataset import PretrainDataset
 from model.model_minigpt import MiniGPTConfig
 from trainer.trainer_utils import (
-    get_model_params,
     is_main_process,
     Logger,
-    get_lr,
     init_distributed_mode,
     setup_seed,
     lm_checkpoint,

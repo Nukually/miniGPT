@@ -35,6 +35,7 @@ class MiniGPTConfig(PretrainedConfig):
             aux_loss_alpha: float = 0.01,
             seq_aux: bool = True,
             norm_topk_prob: bool = True,
+            use_qknorm: bool = False,
             **kwargs
     ):
         super().__init__(**kwargs)
@@ -52,6 +53,7 @@ class MiniGPTConfig(PretrainedConfig):
         self.rms_norm_eps = rms_norm_eps
         self.rope_theta = rope_theta
         self.inference_rope_scaling = inference_rope_scaling
+        self.use_qknorm = use_qknorm
         # 外推长度 = factor * original_max_position_embeddings = 32768
         self.rope_scaling = {
             "beta_fast": 32,
@@ -154,6 +156,12 @@ class Attention(nn.Module):
         self.k_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(args.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(args.num_attention_heads * self.head_dim, args.hidden_size, bias=False)
+        
+        self.use_qknorm = args.use_qknorm
+        if self.use_qknorm:
+            self.q_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=args.rms_norm_eps)
+
         self.attn_dropout = nn.Dropout(args.dropout)
         self.resid_dropout = nn.Dropout(args.dropout)
         self.dropout = args.dropout
@@ -171,6 +179,10 @@ class Attention(nn.Module):
         xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
         xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+
+        if self.use_qknorm:
+            xq = self.q_norm(xq)
+            xk = self.k_norm(xk)
 
         cos, sin = position_embeddings
         xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)

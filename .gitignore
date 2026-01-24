@@ -8,3 +8,4 @@ website/
 pycache/*
 dataset/*.jsonl
 dataset/**/*.jsonl
+checkpoints/

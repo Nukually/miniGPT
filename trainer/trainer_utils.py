@@ -3,6 +3,7 @@
 """
 import os
 import sys
+from contextlib import nullcontext
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import random
@@ -27,7 +28,27 @@ def Logger(content):
 
 
 def get_lr(current_step, total_steps, lr):
-    return lr*(0.1 + 0.45*(1 + math.cos(math.pi * current_step / total_steps)))
+    # WSD策略: Warmup-Stable-Decay
+    warmup_ratio = 0.03
+    decay_ratio = 0.1
+    min_lr_ratio = 0.01
+
+    warmup_steps = int(total_steps * warmup_ratio)
+    decay_steps = int(total_steps * decay_ratio)
+    stable_steps = total_steps - warmup_steps - decay_steps
+
+    if current_step < warmup_steps:
+        # Warmup phase: Linear increase
+        return lr * (current_step / max(1, warmup_steps))
+    elif current_step < warmup_steps + stable_steps:
+        # Stable phase: Constant LR
+        return lr
+    else:
+        # Decay phase: Rapid decay (Cosine decay to min_lr)
+        decay_progress = (current_step - warmup_steps - stable_steps) / max(1, decay_steps)
+        decay_progress = min(1.0, decay_progress)
+        target_lr = lr * min_lr_ratio
+        return target_lr + 0.5 * (lr - target_lr) * (1 + math.cos(math.pi * decay_progress))
 
 
 def init_distributed_mode():
